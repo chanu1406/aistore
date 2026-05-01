@@ -17,7 +17,6 @@ import (
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
-	"github.com/NVIDIA/aistore/cmn/debug"
 	"github.com/NVIDIA/aistore/tools"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
@@ -334,205 +333,209 @@ func TestListInventoryPrefix(t *testing.T) {
 	}
 }
 
+// _nbiPrefixPermScenario is one NBI create + list permutation for TestListInventoryPrefixPermute.
+type _nbiPrefixPermScenario struct {
+	name          string
+	pageSize      int64 // CreateNBIMsg.PageSize
+	namesPerChunk int64
+	listPageSize  int64 // listing PageSize (best-effort for NBI)
+	invName       string
+}
+
+func _runNBIPrefixPermCase(t *testing.T, bck cmn.Bck, bp api.BaseParams, parent string, ma, mm, mz *ioContext, tc _nbiPrefixPermScenario) {
+	t.Helper()
+
+	createMsg := &apc.CreateNBIMsg{
+		Name: tc.invName,
+		LsoMsg: apc.LsoMsg{
+			Prefix:   parent,
+			Props:    apc.GetPropsName,
+			PageSize: tc.pageSize,
+		},
+		NamesPerChunk: tc.namesPerChunk,
+		Force:         true,
+	}
+
+	xid, err := api.CreateNBI(bp, bck, createMsg)
+	tassert.CheckFatal(t, err)
+
+	wargs := xact.ArgsMsg{ID: xid, Kind: apc.ActCreateNBI, Timeout: nbiCreateTimeout}
+	_, err = api.WaitForXactionIC(bp, &wargs)
+	tassert.CheckFatal(t, err)
+
+	var args api.ListArgs
+	if createMsg.Name != "" {
+		args.Header = http.Header{apc.HdrInvName: []string{createMsg.Name}}
+	}
+
+	listNBI := func(prefix string) (entries []*cmn.LsoEnt) {
+		var (
+			token   string
+			seenTok = make(cos.StrSet, 16)
+		)
+		for {
+			lsmsg := &apc.LsoMsg{
+				Prefix:            prefix,
+				Props:             apc.GetPropsName,
+				PageSize:          tc.listPageSize,
+				Flags:             apc.LsNBI,
+				ContinuationToken: token,
+			}
+			lst, err := api.ListObjectsPage(bp, bck, lsmsg, args)
+			tassert.CheckFatal(t, err)
+
+			tassert.Fatalf(t, len(lst.Entries) > 0 || lst.ContinuationToken == "",
+				"empty page with continuation token %q for prefix %q", lst.ContinuationToken, prefix)
+
+			entries = append(entries, lst.Entries...)
+			if lst.ContinuationToken == "" {
+				break
+			}
+			tassert.Fatalf(t, !seenTok.Contains(lst.ContinuationToken),
+				"repeated continuation token %q", lst.ContinuationToken)
+			seenTok.Set(lst.ContinuationToken)
+			token = lst.ContinuationToken
+		}
+
+		for i := range entries {
+			tassert.Fatalf(t, strings.HasPrefix(entries[i].Name, prefix),
+				"entry %q doesn't match prefix %q", entries[i].Name, prefix)
+			if i > 0 {
+				prev, curr := entries[i-1].Name, entries[i].Name
+				tassert.Fatalf(t, prev < curr,
+					"entries not sorted/unique at [%d]: %q >= %q", i, prev, curr)
+			}
+		}
+		return entries
+	}
+
+	missingFromEntries := func(expected []string, got []*cmn.LsoEnt) []string {
+		gotSet := make(cos.StrSet, len(got))
+		for _, e := range got {
+			gotSet.Set(e.Name)
+		}
+		missed := make([]string, 0, 4)
+		for _, name := range expected {
+			if _, ok := gotSet[name]; !ok {
+				missed = append(missed, name)
+			}
+		}
+		return missed
+	}
+
+	gotM := listNBI(mm.prefix)
+	missed := missingFromEntries(mm.objNames, gotM)
+	tassert.Fatalf(t, len(missed) == 0,
+		"missing %v for prefix %q - %d out of %d expected",
+		missed, mm.prefix, len(missed), len(mm.objNames))
+	tassert.Fatalf(t, len(gotM) == mm.num,
+		"prefix %q: expected %d, got %d", mm.prefix, mm.num, len(gotM))
+
+	gotParent := listNBI(parent)
+	expTotal := ma.num + mm.num + mz.num
+
+	expSet := make(cos.StrSet, expTotal)
+	expSet.Add(ma.objNames...)
+	expSet.Add(mm.objNames...)
+	expSet.Add(mz.objNames...)
+	tassert.Fatal(t, len(expSet) == expTotal, "Expected total objects to equal expected")
+
+	gotParentSet := make(cos.StrSet, len(gotParent))
+	for _, en := range gotParent {
+		gotParentSet.Set(en.Name)
+	}
+	missed = missed[:0]
+	for name := range expSet {
+		if _, ok := gotParentSet[name]; !ok {
+			missed = append(missed, name)
+		}
+	}
+	tassert.Fatalf(t, len(missed) == 0,
+		"missing %v for parent prefix %q - %d out of %d expected",
+		missed, parent, len(missed), expTotal)
+	tassert.Fatalf(t, len(gotParent) == expTotal,
+		"parent prefix %q: expected %d, got %d", parent, expTotal, len(gotParent))
+
+	missing := parent + "zzzz/"
+	gotMissing := listNBI(missing)
+	tassert.Fatalf(t, len(gotMissing) == 0,
+		"prefix %q: expected 0, got %d", missing, len(gotMissing))
+}
+
 func TestListInventoryPrefixPermute(t *testing.T) {
 	tools.CheckSkip(t, &tools.SkipTestArgs{RemoteBck: true, Bck: cliBck})
 
-	type test struct {
-		name             string
-		numA, numM, numZ int
-		pageSize         int64 // CreateNBIMsg.PageSize
-		namesPerChunk    int64
-		listPageSize     int64 // listing PageSize (best-effort for NBI)
-		invName          string
-	}
-	tests := []test{
+	// One shared object tree for all scenarios:
+	// Scenarios only differ in CreateNBIMsg + list paging params.
+	const numA, numM, numZ = 70, 80, 80
+	const listSmall = int64(16)
+
+	scenarios := []_nbiPrefixPermScenario{
 		{
-			name: "small-chunks-small-pages",
-			numA: 40, numM: 30, numZ: 50,
+			name:     "small-chunks-small-pages",
 			pageSize: 3, namesPerChunk: 6, listPageSize: 4,
 			invName: "inv-sc-sp",
 		},
 		{
-			name: "small-chunks-pages-empty-invName",
-			numA: 40, numM: 30, numZ: 50,
+			name:     "small-chunks-pages-empty-invName",
 			pageSize: 3, namesPerChunk: 6, listPageSize: 4,
 		},
 		{
-			name: "small-chunks-large-pages",
-			numA: 40, numM: 30, numZ: 50,
+			name:     "small-chunks-large-pages",
 			pageSize: 3, namesPerChunk: 6, listPageSize: 1000,
 			invName: "inv-sc-lp",
 		},
 		{
-			name: "large-chunks-small-pages",
-			numA: 70, numM: 60, numZ: 80,
-			pageSize: 6, namesPerChunk: 60, listPageSize: 3,
+			name:     "large-chunks-small-pages",
+			pageSize: 6, namesPerChunk: 60, listPageSize: listSmall,
 			invName: "inv-lc-sp",
 		},
 		{
-			name: "names-per-chunk",
-			numA: 30, numM: 25, numZ: 35,
+			name:     "names-per-chunk",
 			pageSize: 10, namesPerChunk: 8, listPageSize: 5,
 			invName: "inv-maxent",
 		},
 		{
-			name: "zero-page-size",
-			numA: 40, numM: 30, numZ: 50,
+			name:     "zero-page-size",
 			pageSize: 3, namesPerChunk: 6, listPageSize: 0,
 			invName: "inv-zero-ps",
 		},
 		{
-			name: "tiny-pages-large-chunks",
-			numA: 60, numM: 80, numZ: 40,
-			pageSize: 5, namesPerChunk: 100, listPageSize: 2,
+			name:     "tiny-pages-large-chunks",
+			pageSize: 5, namesPerChunk: 100, listPageSize: listSmall,
 			invName: "inv-tiny-ps",
 		},
 		{
-			name: "many-chunks-tiny-pages",
-			numA: 50, numM: 50, numZ: 50,
-			pageSize: 5, namesPerChunk: 10, listPageSize: 2,
+			name:     "many-chunks-tiny-pages",
+			pageSize: 5, namesPerChunk: 10, listPageSize: listSmall,
 		},
 	}
 
 	bck := cliBck
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			_nbiIniCln(t, bck)
+	_nbiIniCln(t, bck)
 
-			var (
-				parent = "p-" + cos.GenTie() + "/"
-				bp     = tools.BaseAPIParams()
-			)
+	var (
+		parent = "p-" + cos.GenTie() + "/"
+		bp     = tools.BaseAPIParams()
+	)
 
-			m0 := &ioContext{t: t, bck: bck, prefix: parent}
-			m0.init(true /*cleanup*/)
+	m0 := &ioContext{t: t, bck: bck, prefix: parent}
+	m0.init(true /*cleanup*/)
 
-			ma := &ioContext{t: t, bck: bck, prefix: parent + "a/"}
-			mm := &ioContext{t: t, bck: bck, prefix: parent + "m/"}
-			mz := &ioContext{t: t, bck: bck, prefix: parent + "z/"}
+	ma := &ioContext{t: t, bck: bck, prefix: parent + "a/"}
+	mm := &ioContext{t: t, bck: bck, prefix: parent + "m/"}
+	mz := &ioContext{t: t, bck: bck, prefix: parent + "z/"}
 
-			ma.num = tc.numA
-			mm.num = tc.numM
-			mz.num = tc.numZ
+	ma.num, mm.num, mz.num = numA, numM, numZ
 
-			ma.puts()
-			mm.puts()
-			mz.puts()
+	ma.puts()
+	mm.puts()
+	mz.puts()
 
-			createMsg := &apc.CreateNBIMsg{
-				Name: tc.invName,
-				LsoMsg: apc.LsoMsg{
-					Prefix:   parent,
-					Props:    apc.GetPropsName,
-					PageSize: tc.pageSize,
-				},
-				NamesPerChunk: tc.namesPerChunk,
-			}
-
-			xid, err := api.CreateNBI(bp, bck, createMsg)
-			tassert.CheckFatal(t, err)
-
-			wargs := xact.ArgsMsg{ID: xid, Kind: apc.ActCreateNBI, Timeout: nbiCreateTimeout}
-			_, err = api.WaitForXactionIC(bp, &wargs)
-			tassert.CheckFatal(t, err)
-
-			var args api.ListArgs
-			if createMsg.Name != "" {
-				args.Header = http.Header{apc.HdrInvName: []string{createMsg.Name}}
-			}
-
-			listNBI := func(prefix string) (entries []*cmn.LsoEnt) {
-				var (
-					token   string
-					seenTok = make(cos.StrSet, 16)
-				)
-				for {
-					lsmsg := &apc.LsoMsg{
-						Prefix:            prefix,
-						Props:             apc.GetPropsName,
-						PageSize:          tc.listPageSize,
-						Flags:             apc.LsNBI,
-						ContinuationToken: token,
-					}
-					lst, err := api.ListObjectsPage(bp, bck, lsmsg, args)
-					tassert.CheckFatal(t, err)
-
-					tassert.Fatalf(t, len(lst.Entries) > 0 || lst.ContinuationToken == "",
-						"empty page with continuation token %q for prefix %q", lst.ContinuationToken, prefix)
-
-					entries = append(entries, lst.Entries...)
-					if lst.ContinuationToken == "" {
-						break
-					}
-					tassert.Fatalf(t, !seenTok.Contains(lst.ContinuationToken),
-						"repeated continuation token %q", lst.ContinuationToken)
-					seenTok.Set(lst.ContinuationToken)
-					token = lst.ContinuationToken
-				}
-
-				for i := range entries {
-					tassert.Fatalf(t, strings.HasPrefix(entries[i].Name, prefix),
-						"entry %q doesn't match prefix %q", entries[i].Name, prefix)
-					if i > 0 {
-						prev, curr := entries[i-1].Name, entries[i].Name
-						tassert.Fatalf(t, prev < curr,
-							"entries not sorted/unique at [%d]: %q >= %q", i, prev, curr)
-					}
-				}
-				return entries
-			}
-
-			missingFromEntries := func(expected []string, got []*cmn.LsoEnt) []string {
-				gotSet := make(cos.StrSet, len(got))
-				for _, e := range got {
-					gotSet.Set(e.Name)
-				}
-				missed := make([]string, 0, 4)
-				for _, name := range expected {
-					if _, ok := gotSet[name]; !ok {
-						missed = append(missed, name)
-					}
-				}
-				return missed
-			}
-
-			gotM := listNBI(mm.prefix)
-			missed := missingFromEntries(mm.objNames, gotM)
-			tassert.Fatalf(t, len(missed) == 0,
-				"missing %v for prefix %q - %d out of %d expected",
-				missed, mm.prefix, len(missed), len(mm.objNames))
-			tassert.Fatalf(t, len(gotM) == mm.num,
-				"prefix %q: expected %d, got %d", mm.prefix, mm.num, len(gotM))
-
-			gotParent := listNBI(parent)
-			expTotal := ma.num + mm.num + mz.num
-
-			expSet := make(cos.StrSet, expTotal)
-			expSet.Add(ma.objNames...)
-			expSet.Add(mm.objNames...)
-			expSet.Add(mz.objNames...)
-			debug.Assert(len(expSet) == expTotal)
-
-			gotParentSet := make(cos.StrSet, len(gotParent))
-			for _, en := range gotParent {
-				gotParentSet.Set(en.Name)
-			}
-			missed = missed[:0]
-			for name := range expSet {
-				if _, ok := gotParentSet[name]; !ok {
-					missed = append(missed, name)
-				}
-			}
-			tassert.Fatalf(t, len(missed) == 0,
-				"missing %v for parent prefix %q - %d out of %d expected",
-				missed, parent, len(missed), expTotal)
-			tassert.Fatalf(t, len(gotParent) == expTotal,
-				"parent prefix %q: expected %d, got %d", parent, expTotal, len(gotParent))
-
-			missing := parent + "zzzz/"
-			gotMissing := listNBI(missing)
-			tassert.Fatalf(t, len(gotMissing) == 0,
-				"prefix %q: expected 0, got %d", missing, len(gotMissing))
+	for i := range scenarios {
+		scenario := scenarios[i]
+		t.Run(scenario.name, func(t *testing.T) {
+			_runNBIPrefixPermCase(t, bck, bp, parent, ma, mm, mz, scenario)
 		})
 	}
 }
