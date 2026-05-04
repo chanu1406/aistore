@@ -296,13 +296,17 @@ func (dm *DM) Abort() {
 
 func (dm *DM) Send(obj *transport.Obj, roc cos.ReadOpenCloser, tsi *meta.Snode, xctns ...core.Xact) (err error) {
 	err = dm.data.streams.Send(obj, roc, tsi)
-	if err == nil && !transport.ReservedOpcode(obj.Hdr.Opcode) && !dm.SkipGenericStats {
+
+	// xaction Tx stats: data only
+	if err == nil && !obj.Hdr.IsControl() && !dm.SkipGenericStats {
 		xctn := dm.xctn()
 		if len(xctns) > 0 {
 			xctn = xctns[0]
 		}
 		if xctn != nil {
-			xctn.OutObjsAdd(1, obj.Size())
+			if size := obj.Size(); size >= 0 { // known size (ie., non-PDU mode)
+				xctn.OutObjsAdd(1, size)
+			}
 		}
 	}
 	return
@@ -345,7 +349,9 @@ func (dm *DM) wrapRecvData(hdr *transport.ObjHdr, reader io.Reader, err error) e
 		return dm.data.recv(hdr, reader, err)
 	}
 
-	if !dm.SkipGenericStats && hdr.Bck.Name != "" && hdr.ObjName != "" && hdr.ObjAttrs.Size >= 0 {
+	// xaction Rx stats: data only
+	if !dm.SkipGenericStats && hdr.Bck.Name != "" && hdr.ObjName != "" && !hdr.IsControl() &&
+		hdr.ObjAttrs.Size >= 0 /* known size */ {
 		if xctn := dm.xctn(); xctn != nil {
 			xctn.InObjsAdd(1, hdr.ObjAttrs.Size)
 		}

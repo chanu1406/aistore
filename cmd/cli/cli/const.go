@@ -174,14 +174,16 @@ const (
 	cmdClusterDecommission = "decommission"
 
 	// Show subcommands (not all)
-	cmdShowRemoteAIS  = "remote-cluster"
-	cmdShowStats      = "stats"
-	cmdMountpath      = "mountpath"
+	cmdShowRemoteAIS = "remote-cluster"
+	cmdShowStats     = "stats"
+	cmdMountpath     = "mountpath"
+	// performance
 	cmdCapacity       = "capacity"
 	cmdShowDisk       = "disk"
 	cmdShowCounters   = "counters"
 	cmdShowThroughput = "throughput"
 	cmdShowLatency    = "latency"
+	cmdShowIntraData  = "intra-data"
 
 	// Bucket properties subcommands
 	cmdSetBprops   = "set"

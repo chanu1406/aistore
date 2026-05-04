@@ -326,9 +326,12 @@ func (s *Stream) eoObj(err error) {
 		nlog.Infoln(s.String(), obj.Hdr.Cname(), "[", s.numCur, "]")
 	}
 
-	// target stats
-	g.tstats.Inc(cos.StreamsOutObjCount)
-	g.tstats.Add(cos.StreamsOutObjSize, objSize)
+	// stream Tx stats: data only
+	debug.Assert(!obj.Hdr.IsControl() || (objSize == 0 && obj.Hdr.ObjAttrs.Size == 0))
+	if !obj.Hdr.IsControl() {
+		g.tstats.Inc(cos.StreamsOutObjCount)
+		g.tstats.Add(cos.StreamsOutObjSize, objSize) // actual size
+	}
 exit:
 	if err != nil {
 		nlog.Errorln(err)

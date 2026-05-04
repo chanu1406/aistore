@@ -55,6 +55,9 @@ const (
 
 func ReservedOpcode(opc int) bool { return opc >= opcFin }
 
+// control-plane opcodes start at`OpcDone`
+func (hdr *ObjHdr) IsControl() bool { return hdr.Opcode >= OpcDone }
+
 //
 // proto header: serialization
 //

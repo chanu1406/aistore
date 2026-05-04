@@ -29,16 +29,17 @@ import (
 const errIndication = "<<<"
 
 type PerfTabCtx struct {
-	Smap      *meta.Smap
-	Sid       string           // single target, unless ""
-	Metrics   cos.StrKVs       // metric (aka stats) names and kinds
-	Regex     *regexp.Regexp   // filter column names (case-insensitive)
-	Units     string           // IEC, SI, raw
-	Totals    map[string]int64 // metrics to sum up (name => sum(column)), where the name is IN and the sum is OUT
-	TotalsHdr string
-	AvgSize   bool // compute average size on the fly (and show it), e.g.: `get.size/get.n`
-	Idle      bool // currently idle
-	NoColor   bool
+	Smap          *meta.Smap
+	Sid           string           // single target, unless ""
+	Metrics       cos.StrKVs       // metric (aka stats) names and kinds
+	Regex         *regexp.Regexp   // filter column names (case-insensitive)
+	Units         string           // IEC, SI, raw
+	Totals        map[string]int64 // per-metric column sums (metric name => cluster-wide total)
+	TotalsHdr     string
+	DropGroupName string // e.g. "stream"; if non-empty, columns in this group drop the group prefix
+	AvgSize       bool   // compute average size on the fly (and show it), e.g.: `get.size/get.n`
+	Idle          bool   // currently idle
+	NoColor       bool
 }
 
 // return numNZ (non-zero) metrics OR bad status
@@ -109,11 +110,11 @@ func (c *PerfTabCtx) MakeTab(st NodeStatusMap) (*Table, int, error) {
 	// 5. add regex-specified (ie, user-requested) metrics that are missing
 	// ------ api.GetStatsAndStatus() does not return zero counters -------
 	if c.Regex != nil {
-		cols = _addMissingMatchingMetrics(cols, c.Metrics, c.Regex)
+		cols = _addMissingMatchingMetrics(cols, c.Metrics, c.Regex, c.DropGroupName)
 	}
 
 	// 6. convert metric to column names
-	printedColumns := _metricsToColNames(cols, c.Metrics, n2n)
+	printedColumns := _metricsToColNames(cols, c.Metrics, n2n, c.DropGroupName)
 
 	// 7. regex to filter columns, if spec-ed
 	if c.Regex != nil {
@@ -205,40 +206,40 @@ func (c *PerfTabCtx) MakeTab(st NodeStatusMap) (*Table, int, error) {
 		table.addRow(row)
 	}
 
-	if !c.Idle && (c.Totals == nil || numTs <= 1) { // but always show 'idle'
+	// totals row shown when: idle indicator applies, OR there are sums to display across multiple targets
+	showTotalsRow := c.Idle || numNZ == 0 || (c.Totals != nil && numTs > 1)
+	if !showTotalsRow {
 		return table, numNZ, nil
 	}
 
 	// tally up
 	var (
-		row   = make([]string, 0, len(cols))
-		added bool
+		row = make([]string, 0, len(cols))
+		hdr = c.TotalsHdr
 	)
-	row = append(row, c.TotalsHdr)
+	if c.Idle || numNZ == 0 {
+		if c.NoColor {
+			hdr += " (idle)"
+		} else {
+			hdr += " " + fgreen("(idle)")
+		}
+	}
+	row = append(row, hdr)
+
 	for _, h := range cols[1:] {
 		if h.name == colStatus {
 			row = append(row, "")
 			continue
 		}
-		if c.Idle || numNZ == 0 {
-			if !added {
-				row = append(row, fgreen("idle"))
-				added = true
-			} else {
-				row = append(row, "")
-			}
-			continue
-		}
-		val, ok := c.Totals[h.name]
-		if ok {
+		if val, ok := c.Totals[h.name]; ok {
 			kind, ok := c.Metrics[h.name]
 			debug.Assert(ok, h.name)
-			printedValue := FmtStatValue(h.name, kind, val, c.Units)
-			row = append(row, printedValue)
-		} else {
-			row = append(row, "")
+			row = append(row, FmtStatValue(h.name, kind, val, c.Units))
+			continue
 		}
+		row = append(row, "")
 	}
+
 	table.addRow(row)
 	return table, numNZ, nil
 }
@@ -284,7 +285,7 @@ func (st NodeStatusMap) _addStatus(cols []*header) []*header {
 	return cols
 }
 
-func _addMissingMatchingMetrics(cols []*header, metrics cos.StrKVs, regex *regexp.Regexp) []*header {
+func _addMissingMatchingMetrics(cols []*header, metrics cos.StrKVs, regex *regexp.Regexp, dropGroup string) []*header {
 outer:
 	for name := range metrics {
 		for _, h := range cols {
@@ -294,7 +295,7 @@ outer:
 		}
 
 		// regex matching (user-visible, "printed") column names
-		printedName := _metricToPrintedColName(name, cols, metrics, nil)
+		printedName := _metricToPrintedColName(name, cols, metrics, nil, dropGroup)
 		if !regex.MatchString(name) && !regex.MatchString(printedName) {
 			lower := strings.ToLower(printedName)
 			if !regex.MatchString(lower) {
@@ -310,27 +311,29 @@ outer:
 // convert metric names to column names
 // NOTE hard-coded translation constants `.lst` => LIST, et al.
 // for naming conventions, see "naming" or "convention" under stats/*
-func _metricsToColNames(cols []*header, metrics, n2n cos.StrKVs) (printedColumns []*header) {
+func _metricsToColNames(cols []*header, metrics, n2n cos.StrKVs, dropGroup string) (printedColumns []*header) {
 	printedColumns = make([]*header, len(cols)) // one to one
 	for colIdx, h := range cols {
 		var printedName string
 		if h.name == colTarget || h.name == colStatus {
 			printedName = h.name
 		} else {
-			printedName = _metricToPrintedColName(h.name, cols, metrics, n2n)
+			printedName = _metricToPrintedColName(h.name, cols, metrics, n2n, dropGroup)
 		}
 		printedColumns[colIdx] = &header{name: printedName, hide: cols[colIdx].hide}
 	}
 	return
 }
 
-func _metricToPrintedColName(mname string, cols []*header, metrics, n2n cos.StrKVs) (printedName string) {
+func _metricToPrintedColName(mname string, cols []*header, metrics, n2n cos.StrKVs, dropGroup string) (printedName string) {
 	kind, ok := metrics[mname]
 	debug.Assert(ok, mname)
 	parts := strings.Split(mname, ".")
 
 	// first name
 	switch parts[0] {
+	case dropGroup:
+		printedName = ""
 	case "lru":
 		copy(parts[0:], parts[1:])
 		parts = parts[:len(parts)-1]
@@ -356,8 +359,10 @@ func _metricToPrintedColName(mname string, cols []*header, metrics, n2n cos.StrK
 	sb.Grow(32)
 	sb.WriteString(printedName)
 	for j := 1; j < l; j++ {
-		sb.WriteByte('-')
-		sb.WriteString(strings.ToUpper(parts[j]))
+		if sb.Len() > 0 {
+			sb.WriteByte('-')
+		}
+		sb.WriteString(_partToColName(parts[0] /*group*/, parts[j]))
 	}
 	printedName = sb.String()
 
@@ -377,6 +382,19 @@ func _metricToPrintedColName(mname string, cols []*header, metrics, n2n cos.StrK
 		printedName += "(n)"
 	}
 	return printedName
+}
+
+// for stream metrics: "in" => RX, "out" => TX
+func _partToColName(group, part string) string {
+	if group == "stream" {
+		switch part {
+		case "in":
+			return "RX"
+		case "out":
+			return "TX"
+		}
+	}
+	return strings.ToUpper(part)
 }
 
 func _filter(cols, printedColumns []*header, regex *regexp.Regexp) ([]*header, []*header) {

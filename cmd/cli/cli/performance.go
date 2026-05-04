@@ -31,45 +31,66 @@ type (
 // true when called by top-level handler
 var allPerfTabs bool
 
-var verboseCounters = [...]string{
-	stats.LcacheCollisionCount,
-	stats.LcacheEvictedCount,
-	stats.LcacheFlushColdCount,
-	cos.StreamsOutObjCount,
-	cos.StreamsOutObjSize,
-	cos.StreamsInObjCount,
-	cos.StreamsInObjSize,
+var (
+	streamMetrics = [...]string{
+		cos.StreamsOutObjCount, cos.StreamsOutObjSize,
+		cos.StreamsInObjCount, cos.StreamsInObjSize,
+	}
 
-	// NOTE: including (not to confuse with `stats.IOErrGetCount`)
-	stats.ErrGetCount,
+	verboseCounters = append([]string{
+		stats.LcacheCollisionCount,
+		stats.LcacheEvictedCount,
+		stats.LcacheFlushColdCount,
+
+		// NOTE:
+		// - including (not to confuse with `stats.IOErrGetCount`)
+		// - see related feature flag: feat.CountObjectNotFoundStats
+		stats.ErrGetCount,
+	}, streamMetrics[:]...)
+)
+
+func perfFlags(extra ...cli.Flag) []cli.Flag {
+	flags := make([]cli.Flag, 0, len(showPerfBaseFlags)+len(extra))
+	flags = append(flags, showPerfBaseFlags...)
+	flags = append(flags, extra...)
+	return sortFlags(flags)
 }
 
 var (
-	showPerfFlags = sortFlags(append(
-		longRunFlags,
+	// common to all `ais performance` subcommands
+	showPerfBaseFlags = append(longRunFlags,
 		noHeaderFlag,
 		regexColsFlag,
 		unitsFlag,
-		averageSizeFlag,
 		nonverboseFlag,
-		verboseFlag,
-	))
+	)
 
-	// `show performance` command
+	showCountersFlags   = perfFlags(verboseFlag, averageSizeFlag)
+	showThrLatFlags     = perfFlags(verboseFlag)
+	showIntraDataFlags  = perfFlags()
+	showMountpathsFlags = perfFlags(mountpathFlag)
+)
+
+// `show performance` command and its all-tables handler
+var (
 	showCmdPerformance = cli.Command{
 		Name:      commandPerf,
 		Usage:     showPerfArgument,
 		ArgsUsage: optionalTargetIDArgument,
-		Flags:     showPerfFlags,
+		Flags:     showCountersFlags,
 		Action:    showPerfHandler,
 		Subcommands: []cli.Command{
 			showCounters,
 			showThroughput,
 			showLatency,
 			showCmdMpathCapacity,
+			showIntraData,
 			makeAlias(&showCmdDisk, &mkaliasOpts{newName: cmdShowDisk}),
 		},
 	}
+)
+
+var (
 	showCounters = cli.Command{
 		Name: cmdShowCounters,
 		Usage: "Show (GET, PUT, DELETE, RENAME, EVICT, APPEND) object counts, as well as:\n" +
@@ -77,31 +98,48 @@ var (
 			indent2 + "\t- (GET, PUT, etc.) cumulative and average sizes;\n" +
 			indent2 + "\t- associated error counters, if any, and more.",
 		ArgsUsage:    optionalTargetIDArgument,
-		Flags:        showPerfFlags,
+		Flags:        showCountersFlags,
 		Action:       showCountersHandler,
 		BashComplete: suggestTargets,
 	}
 	showThroughput = cli.Command{
-		Name:         cmdShowThroughput,
-		Usage:        "Show GET and PUT throughput, associated (cumulative, average) sizes and counters",
+		Name: cmdShowThroughput,
+		Usage: "Show GET and PUT throughput, associated (cumulative, average) sizes and counters.\n" +
+			indent1 + "\tExamples:\n" +
+			indent1 + "\t- 'ais performance throughput --refresh 10'\t- update every 10s;\n" +
+			indent1 + "\t- 'ais performance throughput --refresh 10 --count 5'\t- 5 iterations, 10s apart.",
 		ArgsUsage:    optionalTargetIDArgument,
-		Flags:        showPerfFlags,
+		Flags:        showThrLatFlags,
 		Action:       showThroughputHandler,
 		BashComplete: suggestTargets,
 	}
 	showLatency = cli.Command{
-		Name:         cmdShowLatency,
-		Usage:        "Show GET, PUT, and APPEND latencies and average sizes",
+		Name: cmdShowLatency,
+		Usage: "Show GET, PUT, and APPEND latencies and average sizes.\n" +
+			indent1 + "\tExamples:\n" +
+			indent1 + "\t- 'ais performance latency --refresh 10'\t- update every 10s;\n" +
+			indent1 + "\t- 'ais performance latency --refresh 10 --count 5'\t- 5 iterations, 10s apart.",
 		ArgsUsage:    optionalTargetIDArgument,
-		Flags:        showPerfFlags,
+		Flags:        showThrLatFlags,
 		Action:       showLatencyHandler,
+		BashComplete: suggestTargets,
+	}
+	showIntraData = cli.Command{
+		Name: cmdShowIntraData,
+		Usage: "Show intra-cluster streaming traffic: RX/TX object counts, sizes, throughput, and average size.\n" +
+			indent1 + "\tExamples:\n" +
+			indent1 + "\t- 'ais performance intra-data --refresh 10'\t- update every 10s;\n" +
+			indent1 + "\t- 'ais performance intra-data --refresh 10 --count 5'\t- 5 iterations, 10s apart.",
+		ArgsUsage:    optionalTargetIDArgument,
+		Flags:        showIntraDataFlags,
+		Action:       showIntraDataHandler,
 		BashComplete: suggestTargets,
 	}
 	showCmdMpathCapacity = cli.Command{
 		Name:         cmdCapacity,
 		Usage:        "Show target mountpaths, disks, and used/available capacity",
 		ArgsUsage:    optionalTargetIDArgument,
-		Flags:        append(showPerfFlags, mountpathFlag),
+		Flags:        showMountpathsFlags,
 		Action:       showMpathCapHandler,
 		BashComplete: suggestTargets,
 	}
@@ -126,6 +164,11 @@ func showPerfHandler(c *cli.Context) error {
 	fmt.Fprintln(c.App.Writer)
 
 	if err := showLatencyHandler(c); err != nil {
+		return err
+	}
+	fmt.Fprintln(c.App.Writer)
+
+	if err := showIntraDataHandler(c); err != nil {
 		return err
 	}
 	fmt.Fprintln(c.App.Writer)
@@ -164,14 +207,16 @@ func showCountersHandler(c *cli.Context) error {
 			// skip assorted internal counters and sizes, unless verbose or regex
 			//
 			if !verbose && regexStr == "" {
-				if slices.Contains(verboseCounters[:], name) {
+				if slices.Contains(verboseCounters, name) {
 					continue
 				}
 			}
 			selected[name] = kind
 		}
 	}
-	return showPerfTab(c, selected, nil, cmdShowCounters, nil /*totals*/, false)
+
+	ctx := &teb.PerfTabCtx{Metrics: selected}
+	return showPerfTab(c, ctx, nil, cmdShowCounters, nil)
 }
 
 func showThroughputHandler(c *cli.Context) error {
@@ -232,8 +277,9 @@ func showThroughputHandler(c *cli.Context) error {
 			}
 		}
 	}
-	// `true` to show average get/put sizes
-	return showPerfTab(c, selected, _throughput /*cb*/, cmdShowThroughput, totals, true)
+
+	ctx := &teb.PerfTabCtx{Metrics: selected, AvgSize: true}
+	return showPerfTab(c, ctx, _throughput, cmdShowThroughput, totals)
 }
 
 // update mapBegin <= (size/s)
@@ -344,8 +390,8 @@ func showLatencyHandler(c *cli.Context) error {
 		selected[ncounter] = stats.KindCounter
 	}
 
-	// `true` to show (and put request latency numbers in perspective)
-	return showPerfTab(c, selected, _latency, cmdShowLatency, nil /*totals*/, true)
+	ctx := &teb.PerfTabCtx{Metrics: selected, AvgSize: true}
+	return showPerfTab(c, ctx, _latency, cmdShowLatency, nil)
 }
 
 // update mapBegin <= (elapsed/num-samples)
@@ -392,7 +438,7 @@ func _latency(c *cli.Context, metrics cos.StrKVs, mapBegin, mapEnd teb.NodeStatu
 }
 
 // (main method)
-func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, totals map[string]int64, inclAvgSize bool) error {
+func showPerfTab(c *cli.Context, ctx *teb.PerfTabCtx, cb perfcb, tag string, totals map[string]int64) error {
 	var (
 		regex       *regexp.Regexp
 		regexStr    = parseStrFlag(c, regexColsFlag)
@@ -402,10 +448,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 	if errU != nil {
 		return errU
 	}
-	avgSize := flagIsSet(c, averageSizeFlag)
-	if inclAvgSize {
-		avgSize = true // caller override
-	}
+
 	var (
 		tid          string
 		node, _, err = arg0Node(c)
@@ -428,6 +471,15 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 	smap, tstatusMap, _, err := fillNodeStatusMap(c, apc.Target)
 	if err != nil {
 		return err
+	}
+
+	ctx.Smap = smap
+	ctx.Sid = tid
+	ctx.Regex = regex
+	ctx.Units = units
+	ctx.NoColor = gcfg.NoColor
+	if flagIsSet(c, averageSizeFlag) {
+		ctx.AvgSize = true // flag OR caller-set
 	}
 
 	params := getLongRunParams(c)
@@ -453,7 +505,6 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 		}
 		setLongRunParams(c, lfooter)
 
-		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units, AvgSize: avgSize, NoColor: gcfg.NoColor}
 		table, num, err := ctx.MakeTab(tstatusMap)
 		if err != nil {
 			return err
@@ -503,7 +554,7 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 			cntRun.mapBegin = mapEnd
 		}
 
-		idle := cb(c, metrics, mapBegin, mapEnd, sleep) // call back to recompute
+		idle := cb(c, ctx.Metrics, mapBegin, mapEnd, sleep) // call back to recompute
 		perfCptn(c, tag)
 
 		// tally up recomputed
@@ -519,8 +570,11 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 			}
 		}
 
-		ctx := teb.PerfTabCtx{Smap: smap, Sid: tid, Metrics: metrics, Regex: regex, Units: units,
-			Totals: totals, TotalsHdr: totalsHdr, AvgSize: avgSize, Idle: idle, NoColor: gcfg.NoColor}
+		// per-iteration runtime fields:
+		ctx.Totals = totals
+		ctx.TotalsHdr = totalsHdr
+		ctx.Idle = idle
+
 		table, _, err := ctx.MakeTab(mapBegin)
 		if err != nil {
 			return err
@@ -534,6 +588,40 @@ func showPerfTab(c *cli.Context, metrics cos.StrKVs, cb perfcb, tag string, tota
 	}
 	return nil
 }
+
+func showIntraDataHandler(c *cli.Context) error {
+	var (
+		totals       = make(map[string]int64, len(streamMetrics))
+		metrics, err = getMetricNames(c)
+	)
+	if err != nil {
+		return err
+	}
+
+	_warnThruLatIters(c)
+
+	selected := make(cos.StrKVs, 2*len(streamMetrics))
+	for name, kind := range metrics {
+		if !slices.Contains(streamMetrics[:], name) {
+			continue
+		}
+		selected[name] = kind
+		totals[name] = 0 // sum cumulative counters/sizes too, not only bps
+		if kind == stats.KindSize {
+			if bpsName, _ := stats.SizeToThroughputCount(name, stats.KindSize); bpsName != "" {
+				selected[bpsName] = stats.KindThroughput
+				totals[bpsName] = 0
+			}
+		}
+	}
+
+	ctx := &teb.PerfTabCtx{Metrics: selected, AvgSize: true, DropGroupName: "stream"}
+	return showPerfTab(c, ctx, _throughput, cmdShowIntraData, totals)
+}
+
+//
+// non-refreshable
+//
 
 func showMpathCapHandler(c *cli.Context) error {
 	var (

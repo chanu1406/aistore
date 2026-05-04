@@ -205,8 +205,9 @@ func (it *iterator) rxObj(hlen int) (err error) {
 			err = errCb
 		}
 		debug.DeadBeefSmall(it.hbuf[:hlen])
-		// stats
-		if err == nil {
+
+		// stream Rx stats: data only
+		if err == nil && !obj.hdr.IsControl() {
 			g.tstats.Inc(cos.StreamsInObjCount) // stats/target_stats.go
 
 			if size >= 0 {
