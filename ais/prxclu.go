@@ -35,24 +35,32 @@ import (
 // v1/cluster handlers
 //
 
-func (p *proxy) clusterHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) cluHandler(w http.ResponseWriter, r *http.Request) {
+	p._clu(w, r, false /*isPub*/)
+}
+
+func (p *proxy) cluPubHandler(w http.ResponseWriter, r *http.Request) {
+	p._clu(w, r, true /*isPub*/)
+}
+
+func (p *proxy) _clu(w http.ResponseWriter, r *http.Request, isPub bool) {
 	switch r.Method {
 	case http.MethodGet:
-		p.httpcluget(w, r)
+		p.httpcluget(w, r, isPub)
 	case http.MethodPost:
-		p.httpclupost(w, r)
+		p.httpclupost(w, r, isPub)
 	case http.MethodPut:
 		if !p.ClusterStarted() {
-			// TODO: may requre preventive return from assorted paths (see e.g. xstatusOne)
+			// TODO: may require preventive return from assorted paths (see e.g. xstatusOne)
 			nlog.Warningln("cluster not started:", r.Method, r.URL.RawQuery)
 		}
-		p.httpcluput(w, r)
+		p.httpcluput(w, r, isPub)
 	case http.MethodDelete:
 		if !p.ClusterStarted() {
 			// TODO: ditto
 			nlog.Warningln("cluster not started:", r.Method, r.URL.RawQuery)
 		}
-		p.httpcludel(w, r)
+		p.httpcludel(w, r, isPub)
 	default:
 		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost, http.MethodPut)
 	}
@@ -61,19 +69,19 @@ func (p *proxy) clusterHandler(w http.ResponseWriter, r *http.Request) {
 // +gen:endpoint GET /v1/cluster[apc.QparamWhat=string]
 // Query cluster states, statistics, and information.
 // Supports various query types: node stats, system info, backends, remote AIS, mountpaths, etc.
-func (p *proxy) httpcluget(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) httpcluget(w http.ResponseWriter, r *http.Request, isPub bool) {
 	var (
 		query = r.URL.Query()
 		what  = query.Get(apc.QparamWhat)
 	)
-	// always allow as the flow involves intra-cluster redirect
-	// (ref 1377 for more context)
+	if isPub {
+		if err := p.checkAccess(w, r, nil, apc.AceShowCluster); err != nil {
+			return
+		}
+	}
+	// execute via IC; public callers still need the same cluster visibility permission
 	if what == apc.WhatOneXactStatus {
 		p.ic.xstatusOne(w, r)
-		return
-	}
-
-	if err := p.checkAccess(w, r, nil, apc.AceShowCluster); err != nil {
 		return
 	}
 
@@ -407,7 +415,7 @@ func _rawResWithTimeout(results sliceResults) (cos.JSONRawMsgs, error, bool /*ti
 
 // +gen:endpoint POST /v1/cluster/{operation}
 // Handle cluster join operations and node keepalives.
-func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request, isPub bool) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathClu.L, 1, true)
 	if err != nil {
 		return
@@ -454,6 +462,7 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request) {
 		}
 		nsi = regReq.SI
 	case apc.AdminJoin: // (administrative join)
+		debug.Assert(isPub)
 		if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
 			return
 		}
@@ -1026,15 +1035,17 @@ func (p *proxy) _syncFinal(ctx *smapModifier, clone *smapX) {
 // +gen:payload apc.ActDecommissionCluster={"action": "decommission", "value": {"sid": "target_id", "skip_rebalance": false, "rm_user_data": true}}
 // +gen:payload apc.ActResetStats={"action": "reset-stats", "value": false}
 // Administrative cluster operations: configuration changes, node management, log rotation, shutdown/decommission operations.
-func (p *proxy) httpcluput(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) httpcluput(w http.ResponseWriter, r *http.Request, isPub bool) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathClu.L, 0, true)
 	if err != nil {
 		return
 	}
 
-	// admin access - all actions
-	if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
-		return
+	// admin access via pub net - all actions
+	if isPub {
+		if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
+			return
+		}
 	}
 
 	if nlog.Stopping() {
@@ -2134,11 +2145,17 @@ func (p *proxy) _stopMaintRMD(ctx *smapModifier, clone *smapX) {
 // +gen:endpoint DELETE /v1/cluster/daemon/{daemon-id}
 // Remove a node from the cluster by daemon ID.
 // Used for self-initiated node removal (e.g., when a node loses all mountpaths).
-func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request, isPub bool) {
+	if isPub {
+		p.writeErrMsg(w, r, "not expecting DELETE /v1/cluster via pub-net", http.StatusForbidden)
+		return
+	}
+
 	apiItems, err := p.parseURL(w, r, apc.URLPathCluDaemon.L, 1, false)
 	if err != nil {
 		return
 	}
+
 	var (
 		sid  = apiItems[0]
 		smap = p.owner.smap.get()
@@ -2167,9 +2184,6 @@ func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
-		return
-	}
 	if err := p.checkIntraCall(r.Header, false /*from primary*/); err != nil {
 		err = fmt.Errorf("%w (action %q)", err, apc.ActSelfRemove)
 		p.writeErr(w, r, err)

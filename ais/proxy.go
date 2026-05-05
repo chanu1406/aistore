@@ -230,17 +230,25 @@ func (p *proxy) Run() error {
 func (p *proxy) initRecvHandlers() {
 	networkHandlers := make([]networkHandler, 0, 28)
 	networkHandlers = append(networkHandlers,
-		networkHandler{r: apc.Reverse, h: p.reverseHandler, net: accessNetPublicControl},
+		// (pub + control): apc.Reverse
+		networkHandler{r: apc.Reverse, h: p.revPubHandler, net: accessNetPublic},
+		networkHandler{r: apc.Reverse, h: p.revHandler, net: accessNetIntraControl | accessNetNoPubFallback},
 
-		// pubnet handlers: cluster must be started
+		// (pub + control): apc.Cluster
+		networkHandler{r: apc.Cluster, h: p.cluPubHandler, net: accessNetPublic},
+		networkHandler{r: apc.Cluster, h: p.cluHandler, net: accessNetIntraControl | accessNetNoPubFallback},
+
+		// (pub + control): apc.Daemon
+		networkHandler{r: apc.Daemon, h: p.daePubHandler, net: accessNetPublic},
+		networkHandler{r: apc.Daemon, h: p.daeHandler, net: accessNetIntraControl | accessNetNoPubFallback},
+
+		// pub-net handlers: cluster must be started
 		networkHandler{r: apc.Buckets, h: p.bucketHandler, net: accessNetPublic},
 		networkHandler{r: apc.Objects, h: p.objectHandler, net: accessNetPublic},
 		networkHandler{r: apc.Download, h: p.dloadHandler, net: accessNetPublic},
 		networkHandler{r: apc.ETL, h: p.etlHandler, net: accessNetPublic},
 
 		networkHandler{r: apc.IC, h: p.ic.handler, net: accessNetIntraControl},
-		networkHandler{r: apc.Daemon, h: p.daemonHandler, net: accessNetPublicControl},
-		networkHandler{r: apc.Cluster, h: p.clusterHandler, net: accessNetPublicControl},
 		networkHandler{r: apc.Tokens, h: p.tokenHandler, net: accessNetPublic},
 
 		networkHandler{r: apc.Metasync, h: p.metasyncHandler, net: accessNetIntraControl},
@@ -2423,7 +2431,31 @@ func (p *proxy) bcastBckAction(method, bucket string, msg *apc.ActMsg, query url
 //
 
 // [METHOD] /v1/daemon
-func (p *proxy) daemonHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) daeHandler(w http.ResponseWriter, r *http.Request) {
+	p._dae(w, r, false /*isPub*/)
+}
+
+func (p *proxy) daePubHandler(w http.ResponseWriter, r *http.Request) {
+	p._dae(w, r, true /*isPub*/)
+}
+
+func (p *proxy) _dae(w http.ResponseWriter, r *http.Request, isPub bool) {
+	var ace apc.AccessAttrs
+	switch r.Method {
+	case http.MethodGet:
+		ace = apc.AceShowCluster
+	case http.MethodPost, http.MethodPut:
+		ace = apc.AceAdmin
+	default:
+		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPost, http.MethodPut)
+		return
+	}
+	if isPub {
+		if err := p.checkAccess(w, r, nil, ace); err != nil {
+			return
+		}
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		p.httpdaeget(w, r)
@@ -2476,9 +2508,6 @@ func (p *proxy) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		query = r.URL.Query()
 		what  = query.Get(apc.QparamWhat)
 	)
-	if err := p.checkAccess(w, r, nil, apc.AceShowCluster); err != nil {
-		return
-	}
 	switch what {
 	case apc.WhatBMD:
 		if renamedBucket := query.Get(whatRenamedLB); renamedBucket != "" {
@@ -2555,9 +2584,6 @@ func (p *proxy) readyToJoinClu(smap *smapX) error {
 func (p *proxy) httpdaeput(w http.ResponseWriter, r *http.Request) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathDae.L, 0, true)
 	if err != nil {
-		return
-	}
-	if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
 		return
 	}
 	// urlpath items
@@ -2680,9 +2706,6 @@ func (p *proxy) httpdaepost(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(apiItems) == 0 {
 		p.writeErrURL(w, r)
-		return
-	}
-	if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
 		return
 	}
 	act := apiItems[0]

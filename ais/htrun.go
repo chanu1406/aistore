@@ -319,9 +319,16 @@ func (h *htrun) regNetHandlers(networkHandlers []networkHandler) {
 		if reg {
 			continue
 		}
+
 		// none of the above
 		switch {
 		case !config.HostNet.UseIntraControl && !config.HostNet.UseIntraData:
+			// when a _separate_ public handler is registered for the same endpoint
+			// (motivation: security)
+			if nh.net.isSet(accessNetNoPubFallback) {
+				continue
+			}
+
 			// no intra-cluster networks: default to pub net
 			handlePub(path, nh.h)
 		case config.HostNet.UseIntraControl && nh.net.isSet(accessNetIntraData):

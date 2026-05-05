@@ -45,13 +45,21 @@ type (
 )
 
 // [METHOD] /v1/reverse
-func (p *proxy) reverseHandler(w http.ResponseWriter, r *http.Request) {
+func (p *proxy) revHandler(w http.ResponseWriter, r *http.Request) {
+	p._reverse(w, r, false /*isPub*/)
+}
+
+func (p *proxy) revPubHandler(w http.ResponseWriter, r *http.Request) {
+	p._reverse(w, r, true /*isPub*/)
+}
+
+func (p *proxy) _reverse(w http.ResponseWriter, r *http.Request, isPub bool) {
 	apiItems, err := p.parseURL(w, r, apc.URLPathReverse.L, 1, false)
 	if err != nil {
 		return
 	}
 
-	// validate targeted endpoint (e.g., daemon/mountpaths)
+	// 1. validate targeted endpoint (e.g., daemon/mountpaths)
 	apiEndpoint := apiItems[0]
 	if !strings.HasPrefix(apiEndpoint, apc.Daemon) {
 		p.writeErrURL(w, r)
@@ -59,7 +67,7 @@ func (p *proxy) reverseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	debug.Assert(len(apiEndpoint) == len(apc.Daemon) || apiEndpoint[len(apc.Daemon)] == '/', apiEndpoint)
 
-	// update URL path: remove `apc.Reverse`
+	// 2. update URL path: remove `apc.Reverse`
 	r.URL.Path = cos.JoinW0(apc.Version, apiEndpoint)
 
 	nodeID := r.Header.Get(apc.HdrNodeID)
@@ -67,6 +75,31 @@ func (p *proxy) reverseHandler(w http.ResponseWriter, r *http.Request) {
 		p.writeErrMsg(w, r, "missing node ID")
 		return
 	}
+
+	// 3. access control
+	var ace apc.AccessAttrs
+
+	switch r.Method {
+	case http.MethodGet:
+		// must be consistent with httpdaeget, httpcluget
+		ace = apc.AceShowCluster
+	case http.MethodPost:
+		// (ditto) httpdaepost, httpclupost
+		ace = apc.AceAdmin
+	case http.MethodPut, http.MethodDelete:
+		// (ditto) httpdaeput/delete and httpcluput/delete
+		ace = apc.AceAdmin
+	default:
+		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost, http.MethodPut)
+		return
+	}
+	if isPub {
+		if err := p.checkAccess(w, r, nil, ace); err != nil {
+			return
+		}
+	}
+
+	// 4. when destination is in maintenance or worse
 	smap := p.owner.smap.get()
 	si := smap.GetNode(nodeID)
 	if si != nil && si.InMaintOrDecomm() {
@@ -98,24 +131,7 @@ func (p *proxy) reverseHandler(w http.ResponseWriter, r *http.Request) {
 		nlog.Warningln(p.String()+":", si.StringEx(), "status is:", daeStatus)
 	}
 
-	// access control
-	switch r.Method {
-	case http.MethodGet:
-		// must be consistent with httpdaeget, httpcluget
-		err = p.checkAccess(w, r, nil, apc.AceShowCluster)
-	case http.MethodPost:
-		// (ditto) httpdaepost, httpclupost
-		err = p.checkAccess(w, r, nil, apc.AceAdmin)
-	case http.MethodPut, http.MethodDelete:
-		// (ditto) httpdaeput/delete and httpcluput/delete
-		err = p.checkAccess(w, r, nil, apc.AceAdmin)
-	default:
-		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost, http.MethodPut)
-		return
-	}
-	if err != nil {
-		return
-	}
+	// 5. when destination is no more
 	if si == nil {
 		v := &p.rproxy.removed
 		v.mu.Lock()
@@ -137,9 +153,10 @@ func (p *proxy) reverseHandler(w http.ResponseWriter, r *http.Request) {
 		go p._clremoved(nodeID)
 	}
 
-	// do
+	// 6. do
 	if si.ID() == p.SID() {
-		p.daemonHandler(w, r) // (apiEndpoint above)
+		// forward to self: access control already enforced above
+		p.daeHandler(w, r) // (apiEndpoint above)
 		return
 	}
 	p.reverseNodeRequest(w, r, si)
