@@ -676,11 +676,12 @@ func (p *proxy) bgetSumm(w http.ResponseWriter, r *http.Request, qbck *cmn.Query
 			bckArgs.createAIS = false
 			bckArgs.dontHeadRemote = summMsg.BckPresent
 		}
-		_, err := bckArgs.initAndTry()
+		b, err := bckArgs.initAndTry()
 		freeBctx(bckArgs)
 		if err != nil {
 			return
 		}
+		qbck = (*cmn.QueryBcks)(b)
 	}
 
 	p.bsummact(w, r, qbck, &summMsg)

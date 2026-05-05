@@ -26,6 +26,12 @@ import (
 	"github.com/NVIDIA/aistore/xact"
 )
 
+type lsofcRes struct {
+	tsi            *meta.Snode // designated target for R-flow; nil for A-flow
+	listRemote     bool        // R-flow vs A-flow
+	wantOnlyRemote bool        // when listRemote: do not populate with AIS metadata
+}
+
 // one page => msgpack rsp
 func (p *proxy) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg) {
 	// LsVerChanged a.k.a. '--check-versions' limitations
@@ -71,7 +77,6 @@ func (p *proxy) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 
 	// GC
 	clear(lst.Entries)
-	lst.Entries = lst.Entries[:0]
 	lst.Entries = nil
 }
 
@@ -95,25 +100,21 @@ func _checkVerChanged(bck *meta.Bck, lsmsg *apc.LsoMsg) error {
 // one page; common code (native, s3 api)
 func (p *proxy) lsPage(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr http.Header, smap *smapX) (*cmn.LsoRes, error) {
 	var (
-		nl             nl.Listener
-		err            error
-		tsi            *meta.Snode
-		lst            *cmn.LsoRes
-		newls          bool
-		listRemote     bool
-		wantOnlyRemote bool
+		nl    nl.Listener
+		lst   *cmn.LsoRes
+		newls bool
 	)
 	if lsmsg.UUID == "" {
 		lsmsg.UUID = cos.GenUUID()
 		newls = true
 	}
-	tsi, listRemote, wantOnlyRemote, err = p._lsofc(bck, lsmsg, smap)
+	fc, err := p._lsofc(bck, lsmsg, smap)
 	if err != nil {
 		return nil, err
 	}
 	if newls {
-		if wantOnlyRemote {
-			nl = xact.NewXactNL(lsmsg.UUID, apc.ActList, &smap.Smap, meta.NodeMap{tsi.ID(): tsi}, bck.Bucket())
+		if fc.wantOnlyRemote {
+			nl = xact.NewXactNL(lsmsg.UUID, apc.ActList, &smap.Smap, meta.NodeMap{fc.tsi.ID(): fc.tsi}, bck.Bucket())
 		} else {
 			// bcast
 			nl = xact.NewXactNL(lsmsg.UUID, apc.ActList, &smap.Smap, nil, bck.Bucket())
@@ -123,7 +124,7 @@ func (p *proxy) lsPage(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr h
 		p.ic.registerEqual(regIC{nl: nl, smap: smap, msg: amsg})
 	}
 
-	if listRemote {
+	if fc.listRemote {
 		// R-flow
 		if lsmsg.StartAfter != "" {
 			// TODO: remote AIS first, then Cloud
@@ -137,13 +138,13 @@ func (p *proxy) lsPage(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr h
 				s = " cont=" + lsmsg.ContinuationToken
 			}
 			if lsmsg.SID != "" {
-				s += " via " + tsi.StringEx()
+				s += " via " + fc.tsi.StringEx()
 			}
 			nlog.Infoln(amsg.Action, "[", lsmsg.UUID, "]", bck.Cname(""), s)
 		}
 
 		config := cmn.GCO.Get()
-		lst, err = p.lsObjsR(bck, lsmsg, hdr, smap, tsi, config, wantOnlyRemote)
+		lst, err = p.lsObjsR(bck, lsmsg, hdr, smap, fc.tsi, config, fc.wantOnlyRemote)
 
 		// TODO `status == http.StatusGone`: at this point we know that this
 		// remote bucket exists and is offline. We should somehow try to list
@@ -151,7 +152,7 @@ func (p *proxy) lsPage(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr h
 		// xaction and return a new `UUID`.
 	} else {
 		// A-flow
-		lst, err = p.lsObjsA(bck, lsmsg, hdr)
+		lst, err = p.lsObjsA(bck, lsmsg, hdr, smap)
 	}
 
 	return lst, err
@@ -160,96 +161,92 @@ func (p *proxy) lsPage(bck *meta.Bck, amsg *apc.ActMsg, lsmsg *apc.LsoMsg, hdr h
 // list-objects: flow control helper
 // - decide: R-flow or A-flow
 // - designate target for R-flow, etc.
-func (p *proxy) _lsofc(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (_ *meta.Snode, listRemote, wantOnlyRemote bool, _ error) {
+func (p *proxy) _lsofc(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (lsofcRes, error) {
 	switch {
 	case lsmsg.IsFlagSet(apc.LsNBI):
-		return p._lsofcNBI(bck, lsmsg)
+		var fc lsofcRes
+		if err := lsmsg.ValidateNBI(); err != nil {
+			e := fmt.Errorf("%s: the request to list via native bucket inventory has invalid or unsupported flags: %v", bck.Cname(""), err)
+			return fc, e
+		}
+		// listing native bucket inventory is always A-flow:
+		// - each target enumerates its local inventory chunks
+		// - proxy merges and paginates the result
+		return fc, nil
+
 	case !bck.IsRemote() || lsmsg.IsFlagSet(apc.LsCached):
-		return p._lsofcInCluster(bck, lsmsg)
+		var fc lsofcRes
+		if lsmsg.IsFlagSet(apc.LsNotCached) {
+			return fc, fmt.Errorf("%s is not a remote bucket - cannot list 'not cached' objects", bck.Cname(""))
+		}
+		return fc, nil
+
 	default:
 		return p._lsofcRemote(bck, lsmsg, smap)
 	}
 }
 
-func (*proxy) _lsofcNBI(bck *meta.Bck, lsmsg *apc.LsoMsg) (_ *meta.Snode, listRemote, wantOnlyRemote bool, _ error) {
-	if err := lsmsg.ValidateNBI(); err != nil {
-		e := fmt.Errorf("%s: the request to list via native bucket inventory has invalid or unsupported flags: %v",
-			bck.Cname(""), err)
-		return nil, false, false, e
-	}
-	// NBI is always A-flow: each target enumerates its local inventory chunks,
-	// proxy merges and paginates the result.
-	return nil, false, false, nil
-}
-
-func (*proxy) _lsofcInCluster(bck *meta.Bck, lsmsg *apc.LsoMsg) (_ *meta.Snode, listRemote, wantOnlyRemote bool, _ error) {
-	if lsmsg.IsFlagSet(apc.LsNotCached) {
-		return nil, false, false, fmt.Errorf("%s is not a remote bucket - cannot list 'not cached' objects", bck.Cname(""))
-	}
-	return nil, false, false, nil
-}
-
-func (p *proxy) _lsofcRemote(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (_ *meta.Snode, listRemote, wantOnlyRemote bool, _ error) {
+func (p *proxy) _lsofcRemote(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (fc lsofcRes, err error) {
 	debug.Assert(bck.IsRemote())
 	debug.Assert(!lsmsg.IsFlagSet(apc.LsCached))
+
+	fc.listRemote = true
 
 	// remote bucket outside cluster (not in BMD) that hasn't been added ("on the fly") by the caller
 	// (lsmsg flag below)
 	if bck.Props.BID == 0 {
 		debug.Assert(lsmsg.IsFlagSet(apc.LsDontAddRemote))
-		wantOnlyRemote = true
+		fc.wantOnlyRemote = true
 		if !lsmsg.WantOnlyRemoteProps() {
 			err := fmt.Errorf("cannot list remote and not-in-cluster bucket %s for not-only-remote object properties: %q",
 				bck.Cname(""), lsmsg.Props)
-			return nil, true, true, err
+			return fc, err
 		}
 	} else {
-		wantOnlyRemote = lsmsg.WantOnlyRemoteProps()
+		fc.wantOnlyRemote = lsmsg.WantOnlyRemoteProps()
 	}
 
 	// check previously designated target vs Smap
 	if lsmsg.SID != "" {
-		return p._lsofcSID(lsmsg, smap, wantOnlyRemote)
+		return p._lsofcSID(lsmsg, smap, fc.wantOnlyRemote)
 	}
 
 	// designate one target to carry-out backend.list-objects
-	tsi, err := smap.HrwTargetTask(lsmsg.UUID)
+	fc.tsi, err = smap.HrwTargetTask(lsmsg.UUID)
 	if err == nil {
-		lsmsg.SID = tsi.ID()
+		lsmsg.SID = fc.tsi.ID()
 	}
-	return tsi, true, wantOnlyRemote, err
+	return fc, err
 }
 
-func (p *proxy) _lsofcSID(lsmsg *apc.LsoMsg, smap *smapX, wantOnlyRemote bool) (_ *meta.Snode, listRemote, _ bool, _ error) {
-	var (
-		err error
-		tsi = smap.GetTarget(lsmsg.SID)
-	)
-	if tsi == nil || tsi.InMaintOrDecomm() {
+func (p *proxy) _lsofcSID(lsmsg *apc.LsoMsg, smap *smapX, wantOnlyRemote bool) (fc lsofcRes, err error) {
+	fc.listRemote = true
+	fc.wantOnlyRemote = wantOnlyRemote
+	fc.tsi = smap.GetTarget(lsmsg.SID)
+	if fc.tsi == nil || fc.tsi.InMaintOrDecomm() {
 		err = &errNodeNotFound{p.si, smap, lsotag + " failure:", lsmsg.SID}
 		nlog.Errorln(err)
 		if smap.CountActiveTs() == 1 {
 			// (walk an extra mile)
 			orig := err
-			tsi, err = smap.HrwTargetTask(lsmsg.UUID)
+			fc.tsi, err = smap.HrwTargetTask(lsmsg.UUID)
 			if err == nil {
-				nlog.Warningf("ignoring [%v] - utilizing the last (or the only) active target %s", orig, tsi)
-				lsmsg.SID = tsi.ID()
+				nlog.Warningf("ignoring [%v] - utilizing the last (or the only) active target %s", orig, fc.tsi)
+				lsmsg.SID = fc.tsi.ID()
 			}
 		}
 	}
-	return tsi, true, wantOnlyRemote, err
+	return fc, err
 }
 
 // A-flow:
 // - bcast list-objects to all targets;
 // - combine, sort and return a merged and sorted result
-func (p *proxy) lsObjsA(bck *meta.Bck, lsmsg *apc.LsoMsg, hdr http.Header) (allEntries *cmn.LsoRes, err error) {
+func (p *proxy) lsObjsA(bck *meta.Bck, lsmsg *apc.LsoMsg, hdr http.Header, smap *smapX) (allEntries *cmn.LsoRes, err error) {
 	var (
 		actMsgExt *actMsgExt
 		args      *bcastArgs
 		results   sliceResults
-		smap      = p.owner.smap.get()
 		isNBI     = lsmsg.IsFlagSet(apc.LsNBI)
 	)
 	if lsmsg.PageSize == 0 && !isNBI {
@@ -422,13 +419,15 @@ func finLsoA(objs *cmn.LsoRes, lsmsg *apc.LsoMsg) {
 		objs.Entries = dedupLso(objs.Entries, maxSize)
 	}
 	if l := len(objs.Entries); l >= maxSize {
-		objs.Entries = objs.Entries[:maxSize]
 		clear(objs.Entries[maxSize:])
+		objs.Entries = objs.Entries[:maxSize]
 		objs.ContinuationToken = objs.Entries[maxSize-1].Name
 	}
 }
 
-func dedupLso(entries cmn.LsoEntries, maxSize int) []*cmn.LsoEnt {
+// - remove adjacent entries with the same Name (the input must already be sorted by Name)
+// - stop after producing maxSize entries
+func dedupLso(entries cmn.LsoEntries, maxSize int) cmn.LsoEntries {
 	var j int
 	for _, en := range entries {
 		if j > 0 && entries[j-1].Name == en.Name {
