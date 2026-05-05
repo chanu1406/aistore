@@ -183,3 +183,48 @@ class TestRetryManager(unittest.TestCase):  # pylint: disable=unused-variable
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.primary_func.call_count, 2)  # Retries once before success
+
+    def test_retry_log_is_concise_no_traceback(self):
+        """During retries, tenacity's `before_sleep_log` emits a one-line
+        summary through `aistore.sdk` without exc_info/traceback."""
+        self.mock_response.status_code = 200
+        self.primary_func.side_effect = [
+            RequestsConnectionError("boom"),
+            self.mock_response,
+        ]
+        with self.assertLogs(level="WARNING") as cm:
+            self.retry_manager.with_retry(self.primary_func)
+
+        retry_records = [
+            r for r in cm.records if r.getMessage().startswith("Retrying ")
+        ]
+        self.assertEqual(len(retry_records), 1)
+        rec = retry_records[0]
+        self.assertIn("ConnectionError", rec.getMessage())
+        self.assertIn("boom", rec.getMessage())
+        # No traceback attached to per-retry log (tenacity passes exc_info=False)
+        self.assertFalse(rec.exc_info)
+
+    def test_final_failure_logs_traceback(self):
+        """When retries are exhausted, the default `retry_error_callback`
+        logs once at ERROR with the original traceback before re-raising."""
+        self.primary_func.side_effect = RequestsConnectionError("boom")
+
+        # Use the default config (which wires in our retry_error_callback) but
+        # cap attempts so the test runs quickly.
+        retry_conf = RetryConfig.default()
+        retry_conf.network_retry.stop = stop_after_attempt(2)
+        retry_conf.network_retry.sleep = lambda _s: None
+        self.retry_manager = RetryManager(self.mock_req_func, retry_config=retry_conf)
+
+        with self.assertLogs(level="WARNING") as cm:
+            with self.assertRaises(RequestsConnectionError):
+                self.retry_manager.with_retry(self.primary_func)
+
+        final_records = [
+            r for r in cm.records if "All retries exhausted" in r.getMessage()
+        ]
+        self.assertEqual(len(final_records), 1)
+        self.assertEqual(final_records[0].levelname, "ERROR")
+        # exc_info populated so the traceback is emitted on final failure
+        self.assertIsNotNone(final_records[0].exc_info)

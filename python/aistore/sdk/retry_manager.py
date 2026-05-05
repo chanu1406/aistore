@@ -37,16 +37,14 @@ class RetryManager:
             request_func, self._retry_config.cold_get_conf
         )
         self._retrying = self._retry_config.network_retry.copy()
-        # In case the provided Retrying instance already has a before_sleep, append our custom one first
-        if (
-            retry_config
-            and retry_config.network_retry
-            and retry_config.network_retry.before_sleep
-        ):
+        # Compose any existing before_sleep (default's `before_sleep_log` or a
+        # user-provided one) with our cold-get presence-poll hook.
+        existing_before_sleep = self._retrying.before_sleep
+        if existing_before_sleep:
 
             def combined_before_sleep(*args):
                 self._before_sleep(*args)
-                retry_config.network_retry.before_sleep(*args)
+                existing_before_sleep(*args)
 
             self._retrying.before_sleep = combined_before_sleep
         else:

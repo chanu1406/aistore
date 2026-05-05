@@ -6,6 +6,15 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 
 ## Unreleased
 
+### Changed
+
+- **Retry logging**: emit the failing request's call stack at ERROR
+  exactly once when retries are exhausted (tenacity
+  `retry_error_callback`, replacing bare `reraise=True`); the per-attempt
+  `before_sleep_log` WARNING now actually fires under the default config
+  (`RetryManager` previously overwrote the configured `before_sleep` with
+  its cold-get hook).
+
 ### Fixed
 
 - **`ObjectFileReader` clean short-EOF recovery**: detect streams that end

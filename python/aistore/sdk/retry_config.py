@@ -35,6 +35,17 @@ NETWORK_RETRY_EXCEPTIONS = (
 )
 
 
+def _log_and_raise_on_exhaust(retry_state):
+    """
+    `retry_error_callback`: log the underlying error with full traceback,
+    then re-raise it. Per-retry attempts stay concise via `before_sleep_log`;
+    the call stack is emitted once, here, when retries are exhausted.
+    """
+    exc = retry_state.outcome.exception()
+    logging.getLogger().error("All retries exhausted; request failed", exc_info=exc)
+    raise exc
+
+
 @dataclass
 class ColdGetConf:
     """
@@ -116,6 +127,6 @@ class RetryConfig:
                 stop=stop_after_attempt(7),
                 retry=retry_if_exception_type(NETWORK_RETRY_EXCEPTIONS),
                 before_sleep=before_sleep_log(logging.getLogger(), logging.WARNING),
-                reraise=True,
+                retry_error_callback=_log_and_raise_on_exhaust,
             ),
         )
