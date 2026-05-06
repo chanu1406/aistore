@@ -287,8 +287,6 @@ func (reb *Reb) Run(smap *meta.Smap, extArgs *ExtArgs) {
 		reb.runNwp(rargs)
 	}
 
-	rargs.xreb.SetCtlMsgFn(rargs.ctlMsg) // TODO -- FIXME: pass via RenewRebalance()
-
 	err := reb.run(rargs)
 
 	if err == nil {
@@ -344,7 +342,13 @@ func (reb *Reb) run(rargs *rargs) error {
 }
 
 func (reb *Reb) initRenew(rargs *rargs, extArgs *ExtArgs, haveStreams bool) bool {
-	rns := xreg.RenewRebalance(rargs.id, &xreg.RebArgs{Bck: rargs.bck, Prefix: rargs.prefix, Flags: extArgs.Flags})
+	xargs := &xreg.RebArgs{
+		Bck:    rargs.bck,
+		Prefix: rargs.prefix,
+		CtlMsg: rargs.ctlMsg,
+		Flags:  extArgs.Flags,
+	}
+	rns := xreg.RenewRebalance(rargs.id, xargs)
 	if rns.Err != nil {
 		return false
 	}

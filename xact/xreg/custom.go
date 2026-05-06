@@ -9,6 +9,7 @@ import (
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
+	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
 )
 
@@ -50,8 +51,9 @@ type (
 		Smap   *meta.Smap
 	}
 	RebArgs struct {
-		Bck    *meta.Bck // (limited-scope)
-		Prefix string    // (ditto)
-		Flags  uint32    // = xact.ArgsMsg.Flags
+		Bck    *meta.Bck     // (limited-scope)
+		Prefix string        // (ditto)
+		CtlMsg func(*cos.SB) // (xreb => Reb)
+		Flags  uint32        // = xact.ArgsMsg.Flags
 	}
 )

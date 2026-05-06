@@ -43,6 +43,7 @@ func (p *proxy) cluPubHandler(w http.ResponseWriter, r *http.Request) {
 	p._clu(w, r, true /*isPub*/)
 }
 
+// access control is per-method - delegated to each httpclu*
 func (p *proxy) _clu(w http.ResponseWriter, r *http.Request, isPub bool) {
 	switch r.Method {
 	case http.MethodGet:

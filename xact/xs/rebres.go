@@ -136,6 +136,9 @@ func newRebalance(p *rebFactory) (xreb *Rebalance, err error) {
 	}
 	_rebID.Store(id)
 
+	// init CtlMsg
+	debug.Assert(xreb.Args.CtlMsg != nil)
+	xreb.ctl.fn = xreb.Args.CtlMsg
 	xreb.ctl.sb.Init(ctlMsgBufSize)
 	xreb.writeStatic(&xreb.ctl.sb)
 
@@ -147,36 +150,25 @@ func newRebalance(p *rebFactory) (xreb *Rebalance, err error) {
 //
 
 const (
-	ctlMsgRefreshFreq = 10 * time.Second
-	ctlMsgBufSize     = 512
+	ctlMsgRefreshIval = 10 * time.Second // coarse refresh must be enough for `ais show job`
+	ctlMsgBufSize     = 256
 )
-
-// The callback is not cleared. FinalCtlMsg freezes the last
-// rendered message for historical show-job output.
-func (xreb *Rebalance) SetCtlMsgFn(fn func(*cos.SB)) {
-	debug.Assert(fn != nil)
-
-	xreb.ctl.mu.Lock()
-	xreb.ctl.fn = fn
-	xreb.refreshLocked()
-	xreb.ctl.last = mono.NanoTime()
-	xreb.ctl.mu.Unlock()
-}
 
 func (xreb *Rebalance) FinalCtlMsg() {
 	xreb.ctl.mu.Lock()
 	xreb.refreshLocked()
-	xreb.ctl.last = math.MaxInt64
+	xreb.ctl.last = math.MaxInt64 // sentinel
 	xreb.ctl.mu.Unlock()
 }
 
+// implementation (via xreb.ctl.fn) - in reb/ctlmsg.go
+// e.g.: "t[xyz]:<fin-streams> done trav:<1s post-trav:2s fin:46s fin-streams:12s errs:3"
 func (xreb *Rebalance) CtlMsg() string {
 	xreb.ctl.mu.Lock()
 
-	last := xreb.ctl.last
-	if last != math.MaxInt64 {
+	if last := xreb.ctl.last; last != math.MaxInt64 {
 		now := mono.NanoTime()
-		if now-last >= int64(ctlMsgRefreshFreq) {
+		if now-last >= int64(ctlMsgRefreshIval) {
 			xreb.refreshLocked()
 			xreb.ctl.last = now
 		}

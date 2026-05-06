@@ -27,6 +27,17 @@ const (
 	showRebHdr = "REB ID\t NODE\t OBJECTS RECV\t SIZE RECV\t OBJECTS SENT\t SIZE SENT\t START\t END\t STATE"
 )
 
+var showRebUsage = "Show global rebalance status and per-target stats.\n" +
+	indent1 + "e.g.:\n" +
+	indent1 + "\t- show rebalance\t- show the most recent rebalance (running or finished);\n" +
+	indent1 + "\t- show rebalance g21\t- show a specific rebalance by ID;\n" +
+	indent1 + "\t- show rebalance --refresh 10\t- continuous monitoring with 10s refresh (until Ctrl-C);\n" +
+	indent1 + "\t- show rebalance --refresh 10 --count 5\t- same as above, limited to 5 iterations;\n" +
+	indent1 + "\t- show rebalance --all\t- include all rebalances: running, finished, and aborted.\n" +
+	indent1 + "for alternative views, see also:\n" +
+	indent1 + "\t- 'ais show job'\t- all running jobs (possibly including rebalance) across the cluster;\n" +
+	indent1 + "\t- 'ais performance intra-data'\t- live peer-to-peer RX/TX counters and sizes (rebalance generates intra-cluster traffic)."
+
 type targetRebSnap struct {
 	tid  string
 	snap *core.Snap
@@ -37,7 +48,7 @@ var (
 
 	showCmdRebalance = cli.Command{
 		Name:      cmdRebalance,
-		Usage:     "show rebalance status and stats",
+		Usage:     showRebUsage,
 		ArgsUsage: jobShowRebalanceArgument,
 		Flags:     sortFlags(showRebFlags),
 		Action:    showRebalanceHandler,

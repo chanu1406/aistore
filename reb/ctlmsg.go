@@ -16,14 +16,13 @@ import (
 
 // Per-stage begin/end nanos surfaced via CtlMsg (`ais show job`):
 //
-//   t1:[stage:<traverse> trav:38s out:12345]
-//   t2:[stage:<post-traverse> trav:38s post-trav:7s out:12345]
-//   t3:[stage:<fin> trav:38s post-trav:9s fin:2s out:12345]
-//   t4:[stage:<fin-streams> trav:38s post-trav:9s fin:2s fin-streams:4s out:12345]
-//   t5:[stage:<fin-streams> done trav:38s post-trav:9s fin:2s fin-streams:4s out:12345]
-//
 // Convention: a phase with begin set and end unset is "running"; everything
 // else is either not yet entered (begin == 0) or finalized (end != 0).
+//
+// Related CLI views:
+//   ais show job [<id>]              - generic xaction view; ctlMsg shown in (ctl: ...) header
+//   ais show rebalance [<id>]        - rebalance-specific view, per-target objects/bytes table
+//   ais performance intra-data       - intra-cluster peer-to-peer traffic over long-lived connections
 
 type rebStats struct {
 	curStage atomic.Uint32
@@ -35,7 +34,7 @@ type rebStats struct {
 }
 
 // Mark transition into newStage. Idempotent. Closes any prior phase that
-// began but didn't end (skipping newStage to allow self re-entry).
+// began, didn't end, and is not current
 func (s *rebStats) stage(newStage uint32) {
 	now := mono.NanoTime()
 
@@ -84,51 +83,44 @@ func (s *rebStats) finalize() {
 	}
 }
 
+// xreb.CtlMsg() callback (set via xreg.RebArgs)
 func (rargs *rargs) ctlMsg(sb *cos.SB) {
-	xreb := rargs.xreb
-	s := &rargs.stats
-	terminal := xreb.IsAborted() || xreb.IsDone()
-
 	if sb.Len() > 0 {
 		sb.WriteString("; ")
 	}
 
 	sb.WriteString(core.T.String())
 	sb.WriteUint8(':')
+
+	s := &rargs.stats
 	sb.WriteString(stages[s.curStage.Load()])
 
-	if xreb.IsAborted() {
+	xreb := rargs.xreb
+	aborted := xreb.IsAborted()
+	if aborted {
 		sb.WriteString(" aborted")
 	} else if xreb.IsDone() {
 		sb.WriteString(" done")
 	}
 
 	now := mono.NanoTime()
-	s.writeTimes(sb, now, terminal)
+	s.writeTimes(sb, now)
 
-	if n := xreb.OutObjs(); n > 0 {
-		sb.WriteString(" tx:")
-		sb.WriteString(strconv.FormatInt(n, 10))
-	}
-	if n := xreb.InObjs(); n > 0 {
-		sb.WriteString(" rx:")
-		sb.WriteString(strconv.FormatInt(n, 10))
-	}
 	if ecnt := xreb.ErrCnt(); ecnt > 0 {
 		sb.WriteString(" errs:")
 		sb.WriteString(strconv.Itoa(ecnt))
 	}
 }
 
-func (s *rebStats) writeTimes(sb *cos.SB, now int64, terminal bool) {
+func (s *rebStats) writeTimes(sb *cos.SB, now int64) {
 	cur := s.curStage.Load()
-	s.writePhase(sb, " trav:", s.travBegin.Load(), s.travEnd.Load(), now, !terminal && cur == rebStageTraverse)
-	s.writePhase(sb, " post-trav:", s.postTravBegin.Load(), s.postTravEnd.Load(), now, !terminal && cur == rebStagePostTraverse)
-	s.writePhase(sb, " fin:", s.finBegin.Load(), s.finEnd.Load(), now, !terminal && cur == rebStageFin)
-	s.writePhase(sb, " fin-streams:", s.finStreamBegin.Load(), s.finStreamEnd.Load(), now, !terminal && cur == rebStageFinStreams)
+	s.writePhase(sb, " trav:", s.travBegin.Load(), s.travEnd.Load(), now, cur == rebStageTraverse)
+	s.writePhase(sb, " post-trav:", s.postTravBegin.Load(), s.postTravEnd.Load(), now, cur == rebStagePostTraverse)
+	s.writePhase(sb, " fin:", s.finBegin.Load(), s.finEnd.Load(), now, cur == rebStageFin)
+	s.writePhase(sb, " fin-streams:", s.finStreamBegin.Load(), s.finStreamEnd.Load(), now, cur == rebStageFinStreams)
 }
 
-func (*rebStats) writePhase(sb *cos.SB, label string, begin, end, now int64, running bool) {
+func (*rebStats) writePhase(sb *cos.SB, label string, begin, end, now int64, current bool) {
 	if begin == 0 {
 		return
 	}
@@ -136,10 +128,10 @@ func (*rebStats) writePhase(sb *cos.SB, label string, begin, end, now int64, run
 	switch {
 	case end != 0:
 		dur = time.Duration(end - begin)
-	case running:
+	case current:
 		dur = time.Duration(now - begin)
 	default:
-		return // began, didn't end, not current — drop silently
+		return // began, didn't end, and either not current or we're aborted
 	}
 	if dur <= 0 {
 		return

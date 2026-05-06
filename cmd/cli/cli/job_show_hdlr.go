@@ -60,25 +60,26 @@ var showJobUsage = "Show running and/or finished jobs:\n" +
 	indent1 + "\t" + formatJobNames() +
 	indent1 + "(use any of these names with 'ais show job' command, or try shortcuts: \"evict\", \"prefetch\", \"copy\", \"delete\", \"ec\")\n" +
 	indent1 + "e.g.:\n" +
-	indent1 + "\t- show job prefetch-listrange\t- show all running prefetch jobs;\n" +
-	indent1 + "\t- show job prefetch\t- same as above;\n" +
-	indent1 + "\t- show job prefetch --top 5\t- show 5 most recent prefetch jobs;\n" +
-	indent1 + "\t- show job tco-cysbohAGL\t- show a given (multi-object copy/transform) job identified by its unique ID;\n" +
-	indent1 + "\t- show job copy-listrange\t- show all running multi-object copies;\n" +
-	indent1 + "\t- show job copy-objects\t- same as above (using display name);\n" +
-	indent1 + "\t- show job copy\t- show all copying jobs including both bucket-to-bucket and multi-object;\n" +
-	indent1 + "\t- show job copy-objects --all\t- show both running and already finished (or stopped) multi-object copies;\n" +
-	indent1 + "\t- show job copy-objects --all --top 10\t- show 10 most recent multi-object copy jobs;\n" +
+	indent1 + "\t- show job prefetch\t- show all running prefetch jobs;\n" +
+	indent1 + "\t- show job copy\t- show all copying jobs (bucket-to-bucket and multi-object);\n" +
+	indent1 + "\t- show job copy-objects\t- show all running multi-object copies (canonical name for 'copy-listrange');\n" +
+	indent1 + "\t- show job ec\t- show all erasure-coding jobs;\n" +
+	indent1 + "\t- show job evict\t- show all running bucket and/or data evicting jobs;\n" +
+	indent1 + "\t- show job list (or: 'show job ls')\t- show all running list-objects jobs;\n" +
 	indent1 + "\t- show job rechunk\t- show all running rechunk jobs;\n" +
 	indent1 + "\t- show job index-shard\t- show all running shard-indexing jobs;\n" +
-	indent1 + "\t- show job ec\t- show all erasure-coding;\n" +
-	indent1 + "\t- show job list\t- show all running list-objects jobs;\n" +
-	indent1 + "\t- show job ls\t- same as above;\n" +
-	indent1 + "\t- show job ls --refresh 10\t- same as above with periodic _refreshing_ every 10 seconds;\n" +
-	indent1 + "\t- show job ls --refresh 10 --count 4\t- same as above but only for the first four 10-seconds intervals;\n" +
-	indent1 + "\t- show job prefetch --refresh 1m\t- show all running prefetch jobs at 1 minute intervals (until Ctrl-C);\n" +
-	indent1 + "\t- show job evict\t- all running bucket and/or data evicting jobs;\n" +
-	indent1 + "\t- show job --all\t- show absolutely all jobs, running and finished."
+	indent1 + "\t- show job tco-cysbohAGL\t- show a specific job by its unique ID;\n" +
+	indent1 + "  filtering and limiting:\n" +
+	indent1 + "\t- show job --all\t- include finished and aborted jobs (default: running only);\n" +
+	indent1 + "\t- show job prefetch --top 5\t- show 5 most recent prefetch jobs;\n" +
+	indent1 + "\t- show job copy-objects --all --top 10\t- 10 most recent multi-object copies, running or finished;\n" +
+	indent1 + "  continuous monitoring:\n" +
+	indent1 + "\t- show job ls --refresh 10\t- refresh every 10 seconds (until Ctrl-C);\n" +
+	indent1 + "\t- show job ls --refresh 10 --count 4\t- same as above, limited to 4 iterations;\n" +
+	indent1 + "\t- show job prefetch --refresh 1m\t- 1-minute refresh interval (until Ctrl-C).\n" +
+	indent1 + "alternative views:\n" +
+	indent1 + "\t- 'ais show rebalance'\t- focused rebalance view with per-target send/receive table;\n" +
+	indent1 + "\t- 'ais performance intra-data'\t- live peer-to-peer RX/TX counters and sizes."
 
 var showJobFlags = append(
 	longRunFlags,
